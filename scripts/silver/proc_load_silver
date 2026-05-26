@@ -1,0 +1,289 @@
+/*
+===============================================================================
+Stored Procedure: Load Silver Layer (Bronze -> Silver)
+===============================================================================
+Script Purpose:
+    This stored procedure performs the ETL (Extract, Transform, Load) process to 
+    populate the 'silver' tables from the 'bronze' .
+	Actions Performed:
+		- Truncates Silver tables.
+		- Inserts transformed and cleansed data from Bronze into Silver tables.
+		
+Parameters:
+    None. 
+	  This stored procedure does not accept any parameters or return any values.
+
+Usage Example:
+    call load_silver();
+===============================================================================
+*/
+
+-- Creating Procedure to load data from bronze layer to silver layer 
+
+delimiter //
+create procedure load_silver()
+begin
+
+-- Calculate Execution Time for each query and batch query
+
+	declare start_time datetime;
+    declare end_time datetime;
+    declare batch_start_time datetime;
+    declare batch_end_time datetime;
+
+-- ------------------------------------
+-- ERROR HANDLING
+-- ------------------------------------
+	
+    declare error_message text;
+	declare error_state text;
+	declare error_number int;
+    
+    declare exit handler for sqlexception -- Tells SQL for execute this block if error happens
+    begin
+		get diagnostics condition 1 -- fetches details about latest error
+			error_number = MYSQL_ERRNO,
+			error_message = MESSAGE_TEXT,
+			error_state = RETURNED_SQLSTATE;
+		select
+			error_number as error_no,
+            error_message as error_msg,
+            error_state as sql_state;
+	end;
+
+
+-- Batch start time
+	set batch_start_time = now();
+
+	select '======================================' as message;
+	select '           Loading Silver Layer       ' as message;
+	select '======================================' as message;
+    
+   -- -----------------------CRM TABLES LOADING-----------------------
+    set start_time = now();
+    select '======================================' as message;
+	select '           Loading CRM Tables      ' as message;
+	select '======================================' as message;
+    
+
+-- -----------------------------------------------------------------
+-- INSERT CLEAN DATA INTO SILVER cust_info
+--  ---------------------------------------------------------------
+	select '>> Truncating Table: Silver_crm_cust_info' as message;
+	truncate table silver_crm_cust_info;
+	select '>> Inserting Data Into: silver_crm_cust_info' as message;
+	insert into silver_crm_cust_info(
+	cst_id,
+	cst_key,
+	cst_firstname,
+	cst_lastname,
+	cst_marital_status,
+	cst_gndr,
+	cst_create_date)
+	select
+	 cst_id,
+	 cst_key,
+	 trim(cst_firstname) as cst_firstname,
+	 trim(cst_lastname) as cst_lastname,
+	 case 
+		when Upper(trim(cst_marital_status)) = 'M' then 'Married'
+		when Upper(trim(cst_marital_status)) = 'S' then 'Single'
+		else 'Unknown'
+	 end as cst_marital_status,
+
+	 case 
+		when Upper(trim(cst_gndr)) = 'F' then 'Female'
+		when Upper(trim(cst_gndr)) = 'M' then 'Male'
+		else 'Unknown'
+	 end as cst_gndr,
+	 cst_create_date
+	 from
+	(select *,
+	row_number() over(partition by cst_id order by cst_create_date desc) as flag_last
+	from bronze_crm_cust_info
+	where cst_id is not null) t
+	where flag_last = 1;
+
+
+	-- -----------------------------------------------------------------
+	-- INSERT CLEAN DATA INTO SILVER Prod_info 
+	--  ---------------------------------------------------------------
+	select '>> Truncating Table: Silver_crm_prod_info' as message;
+	truncate table silver_crm_prod_info;
+	select '>> Inserting Data Into: silver_crm_prod_info' as message;
+	insert into silver_crm_prod_info(
+	prd_id,
+	cat_id ,
+	prd_key,
+	prd_nm ,
+	prd_cost,
+	prd_line ,
+	prd_start_dt,
+	prd_end_dt
+	)
+	select prd_id, 
+	replace(substring(prd_key, 1,5), '-', '_') as cat_id, -- Extract Category ID
+	substring(prd_key, 7, length(prd_key)) as prd_key,  -- Extract Product ID
+	prd_nm,
+	ifnull(prd_cost, 0) as prd_cost, -- Handling Nulls
+	case upper(trim(prd_line))
+		when  'M' then 'Mountain'
+		when 'S' then 'Other Sales'
+		when  'R' then 'Road'
+		when  'T' then 'Touring'
+		else 'Unknown'
+	end as prd_line, -- Map Product Codes to descriptive values
+	cast(prd_start_dt as date) as prd_start_dt,
+	cast(date_sub(lead(prd_start_dt) 
+	over(partition by prd_key order by prd_start_dt), -- calculate end date as one day before the next starting date
+	 interval 1 day) as date) as prd_end_dt
+	from bronze_crm_prod_info
+	;
+
+
+
+	-- -----------------------------------------------------------------
+	-- INSERT CLEAN DATA INTO SILVER sales_details 
+	--  ---------------------------------------------------------------
+	select '>> Truncating Table: Silver_crm_sales_details' as message;
+	truncate table silver_crm_sales_details;
+	select '>> Inserting Data Into: silver_crm_sales_details' as message;
+	insert into silver_crm_sales_details(
+	sls_ord_num,
+	sls_prd_key,
+	sls_cust_id,
+	sls_order_dt,
+	sls_ship_dt,
+	sls_due_dt,
+	sls_sales,
+	sls_quantity,
+	sls_price)
+	select 
+	sls_ord_num,
+	sls_prd_key,
+	sls_cust_id,
+	case
+		when sls_order_dt = 0 or length(sls_order_dt) != 8 then null
+		else str_to_date(cast(sls_order_dt as char), '%Y%m%d') 
+	end as sls_order_dt,
+	case
+		when sls_ship_dt = 0 or length(sls_ship_dt) != 8 then null
+		else cast(cast(sls_ship_dt as char) as date) 
+	end as sls_ship_dt,
+	case
+		when sls_due_dt = 0 or length(sls_due_dt) != 8 then null
+		else cast(cast(sls_due_dt as char) as date) 
+	end as sls_due_dt,
+	case
+		when sls_sales <= 0 
+			or sls_quantity is null 
+			or sls_price is null
+			or sls_sales != (coalesce(sls_quantity,0) * abs(coalesce(sls_price,0)))
+		then  coalesce(sls_quantity,0) * abs(coalesce(sls_price,0))
+		else sls_sales
+	end as sls_sales,
+	sls_quantity,
+	case
+		WHEN (sls_price <= 0 OR sls_price IS NULL)
+			 AND sls_quantity > 0
+		THEN ABS(sls_sales) / sls_quantity
+		ELSE COALESCE(sls_price, 0)
+	END as sls_price
+	from bronze_crm_sales_details;
+
+
+	set end_time = now();
+    select concat(
+    'CRM Tables Created In: ',
+    timestampdiff(microsecond, start_time, end_time) / 1000000,
+    'seconds') as CRM_load_duration;
+    
+       -- -----------------------ERP TABLES LOADING-----------------------
+    set start_time = now();
+    select '======================================' as message;
+	select '           Loading ERP Tables      ' as message;
+	select '======================================' as message;
+    
+    
+	-- -----------------------------------------------------------------
+	-- INSERT CLEAN DATA INTO SILVER erp_cust_az12 
+	--  ---------------------------------------------------------------
+
+	select '>> Truncating Table: Silver_erp_cust_az12' as message;
+	truncate table silver_erp_cust_az12;
+	select '>> Inserting Data Into: silver_erp_cust_az12' as message;
+	insert into silver_erp_cust_az12(
+	cid,
+	bdate,
+	gen)
+	select
+	case 
+		when cid like 'NAS%' then substring(cid, 4, length(cid))
+		else cid
+	end as cid, -- Removes 'NAS' prefix if present
+	case
+		when bdate > now() then null
+		else bdate
+	end as bdate, -- Set Future birthdates to Nulls
+	case
+		when upper(trim(gen)) in ('F', 'Female') then 'Female'
+		when upper(trim(gen)) in ('M', 'Male') then 'Male'
+		else 'Unknown'
+	end as gen -- Normalize gender values and handle unknown cases
+	from bronze_erp_cust_az12;
+
+
+	-- -----------------------------------------------------------------
+	-- INSERT CLEAN DATA INTO SILVER erp_loc_a101 
+	--  ---------------------------------------------------------------
+
+	select '>> Truncating Table: Silver_erp_loc_a101 ' as message;
+	truncate table silver_erp_loc_a101 ;
+	select '>> Inserting Data Into: silver_erp_loc_a101 'as message;
+	insert into silver_erp_loc_a101(
+	cid,
+	cntry)
+	select 
+	replace(cid, '-', '') as cid,
+	case
+		when trim(cntry) = 'DE' then 'Germany'
+		when trim(cntry) in( 'US', 'USA')  then 'United States' 
+		when trim(cntry) = '' or cntry is null then 'Unknown'
+		else trim(cntry)
+	end as cntry -- Normalize and Handle Missing or blank country codes
+	from bronze_erp_loc_a101;
+
+
+
+	-- -----------------------------------------------------------------
+	-- INSERT CLEAN DATA INTO SILVER erp_px_cat_g1v2
+	--  ---------------------------------------------------------------
+	select '>> Truncating Table: Silver_erp_px_cat_g1v2 ' as message;
+	truncate table silver_erp_px_cat_g1v2 ;
+	select '>> Inserting Data Into: silver_erp_px_cat_g1v2 ' as message;
+	insert into silver_erp_px_cat_g1v2(
+	id,
+	cat,
+	subcat,
+	maintenance
+	)
+	select 
+	id,
+	cat,
+	subcat,
+	maintenance
+	from bronze_erp_px_cat_g1v2;
+
+	
+    set end_time = now();
+    select concat('ERP Tables Loaded In: ',
+    timestampdiff(microsecond, start_time, end_time)/ 1000000,
+    'seconds') as ERP_load_duration;
+    
+
+	set batch_end_time = now();
+	select concat('TOTAL DATA LOAD DURATION: ',
+	timestampdiff(microsecond, batch_start_time, batch_end_time)/ 1000000,
+	'seconds') as total_loading_duration;
+
+end //
